@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
+from .aug_cycle_gan_modules import *
 
 
 ###############################################################################
@@ -613,3 +614,206 @@ class PixelDiscriminator(nn.Module):
     def forward(self, input):
         """Standard forward."""
         return self.net(input)
+
+######################################################################
+# Augmented CycleGAN models
+######################################################################
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        m.weight.data.normal_(0.0, 0.02)
+        if hasattr(m.bias, 'data'):
+            m.bias.data.fill_(0)
+    elif classname.find('BatchNorm2d') != -1:
+        m.weight.data.normal_(1.0, 0.02)
+        m.bias.data.fill_(0)
+
+class CINResnetGenerator(nn.Module):
+    def __init__(self, nlatent, input_nc, output_nc, ngf=64, norm_layer=CondInstanceNorm,
+                 use_dropout=False, n_blocks=9, gpu_ids=[], padding_type='reflect'):
+        assert(n_blocks >= 0)
+        super(CINResnetGenerator, self).__init__()
+        self.gpu_ids = gpu_ids
+
+        instance_norm = functools.partial(nn.InstanceNorm2d, affine=True)
+
+        model = [
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, stride=1, bias=True),
+            norm_layer(ngf, nlatent),
+            nn.ReLU(True),
+
+            nn.Conv2d(ngf, 2*ngf, kernel_size=3, padding=1, stride=1, bias=True),
+            norm_layer(2*ngf, nlatent),
+            nn.ReLU(True),
+
+            nn.Conv2d(2*ngf, 4*ngf, kernel_size=3, padding=1, stride=2, bias=True),
+            norm_layer(4*ngf, nlatent),
+            nn.ReLU(True)
+        ]
+        
+        for i in range(3):
+            model += [CINResnetBlock(x_dim=4*ngf, z_dim=nlatent, padding_type=padding_type,
+                                     norm_layer=norm_layer, use_dropout=use_dropout, use_bias=True)]
+
+        model += [
+            nn.ConvTranspose2d(4*ngf, 2*ngf, kernel_size=3, stride=2, padding=1,
+                               output_padding=1, bias=True),
+            norm_layer(2*ngf , nlatent),
+            nn.ReLU(True),
+
+            nn.Conv2d(2*ngf, ngf, kernel_size=3, padding=1, stride=1, bias=True),
+            norm_layer(ngf, nlatent),
+            nn.ReLU(True),
+
+            nn.Conv2d(ngf, output_nc, kernel_size=7, padding=3),
+            nn.Tanh()
+        ]
+
+        self.model = TwoInputSequential(*model)
+
+    def forward(self, input, noise):
+        if len(self.gpu_ids)>1 and isinstance(input.data, torch.cuda.FloatTensor):
+            return nn.parallel.data_parallel(self.model, (input, noise), self.gpu_ids)
+        else:
+            return self.model(input, noise)
+
+######################################################################
+# Discriminator that supports stochastic mappings
+# using Conditonal instance norm (can support CBN easily)
+######################################################################
+
+class DiscriminatorLatent(nn.Module):
+    def __init__(self, nlatent, ndf,
+                 use_sigmoid=False, gpu_ids=[]):
+        super(DiscriminatorLatent, self).__init__()
+
+        self.gpu_ids = gpu_ids
+        self.nlatent = nlatent
+
+        use_bias = True
+        sequence = [
+            nn.Linear(nlatent, ndf),
+            # nn.BatchNorm1d(ndf),
+            nn.LeakyReLU(0.2, True),
+
+            nn.Linear(ndf, ndf),
+            # nn.BatchNorm1d(ndf),
+            nn.LeakyReLU(0.2, True),
+
+            nn.Linear(ndf, ndf),
+            # nn.BatchNorm1d(ndf),
+            nn.LeakyReLU(0.2, True),
+
+            nn.Linear(ndf, 1)
+        ]
+
+        if use_sigmoid:
+            sequence += [nn.Sigmoid()]
+
+        self.model = nn.Sequential(*sequence)
+
+    def forward(self, input):
+        if input.dim() == 4:
+            input = input.view(input.size(0), self.nlatent)
+
+        if len(self.gpu_ids)>1 and isinstance(input.data, torch.cuda.FloatTensor):
+            return nn.parallel.data_parallel(self.model, input, self.gpu_ids)
+        else:
+            return self.model(input)
+
+######################################################################
+# Encoder network for latent variables
+######################################################################
+class LatentEncoder(nn.Module):
+    def __init__(self, nlatent, input_nc, nef, norm_layer, gpu_ids=[]):
+        super(LatentEncoder, self).__init__()
+        self.gpu_ids = gpu_ids
+        use_bias = False
+
+        kw = 3
+        sequence = [
+            nn.Conv2d(input_nc, nef, kernel_size=kw, stride=2, padding=1, bias=True),
+            nn.ReLU(True),
+
+            nn.Conv2d(nef, 2*nef, kernel_size=kw, stride=2, padding=1, bias=use_bias),
+            norm_layer(2*nef),
+            nn.ReLU(True),
+
+            nn.Conv2d(2*nef, 4*nef, kernel_size=kw, stride=2, padding=1, bias=use_bias),
+            norm_layer(4*nef),
+            nn.ReLU(True),
+
+            nn.Conv2d(4*nef, 8*nef, kernel_size=kw, stride=2, padding=1, bias=use_bias),
+            norm_layer(8*nef),
+            nn.ReLU(True),
+
+            nn.Conv2d(8*nef, 8*nef, kernel_size=4, stride=1, padding=0, bias=use_bias),
+            norm_layer(8*nef),
+            nn.ReLU(True),
+
+        ]
+
+        self.conv_modules = nn.Sequential(*sequence)
+
+        # make sure we return mu and logvar for latent code normal distribution
+        self.enc_mu = nn.Conv2d(8*nef, nlatent, kernel_size=1, stride=1, padding=0, bias=True)
+        self.enc_logvar = nn.Conv2d(8*nef, nlatent, kernel_size=1, stride=1, padding=0, bias=True)
+
+    def forward(self, input):
+        if len(self.gpu_ids)>1 and isinstance(input.data, torch.cuda.FloatTensor):
+            conv_out = nn.parallel.data_parallel(self.conv_modules, input, self.gpu_ids)
+            mu = nn.parallel.data_parallel(self.enc_mu, conv_out, self.gpu_ids)
+            logvar = nn.parallel.data_parallel(self.enc_logvar, conv_out, self.gpu_ids)
+        else:
+            conv_out = self.conv_modules(input)
+            mu = self.enc_mu(conv_out)
+            logvar = self.enc_logvar(conv_out)
+        return mu.mean(-1, True).mean(-2, True)
+
+
+def define_stochastic_G(nlatent, input_nc, output_nc, ngf, norm='instance', use_dropout=False, gpu_ids=[]):
+
+    netG = None
+    use_gpu = len(gpu_ids) > 0
+
+    if use_gpu:
+        assert(torch.cuda.is_available())
+
+    norm_layer = CondInstanceNorm
+
+    netG = CINResnetGenerator(nlatent, input_nc, output_nc, ngf, norm_layer=norm_layer,
+                              use_dropout=use_dropout, n_blocks=9, gpu_ids=gpu_ids)
+
+    if len(gpu_ids) > 0:
+        netG.cuda()
+    netG.apply(weights_init)
+    return netG
+
+def define_LAT_D(nlatent, ndf, use_sigmoid=False, gpu_ids=[]):
+    netD = None
+    use_gpu = len(gpu_ids) > 0
+
+    if use_gpu:
+        assert(torch.cuda.is_available())
+
+    netD = DiscriminatorLatent(nlatent, ndf, use_sigmoid=use_sigmoid, gpu_ids=gpu_ids)
+
+    if use_gpu:
+        netD.cuda()
+    netD.apply(weights_init)
+    return netD
+
+def define_E(nlatent, input_nc, nef, norm='batch', gpu_ids=[]):
+    use_gpu = len(gpu_ids) > 0
+    norm_layer = get_norm_layer(norm_type=norm)
+
+    if use_gpu:
+        assert(torch.cuda.is_available())
+    netE = LatentEncoder(nlatent, input_nc, nef, norm_layer=norm_layer, gpu_ids=gpu_ids)
+
+    if use_gpu:
+        netE.cuda()
+    netE.apply(weights_init)
+    return netE
